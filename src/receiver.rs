@@ -12,19 +12,21 @@ use wincode::config::DefaultConfig;
 pub struct IpcReceiver;
 
 impl IpcReceiver {
-    /// Lowest latency: `handler` runs on the polling thread, zero extra hops.
+    /// Zero-copy: `view` gets the raw serialized bytes directly in shared
+    /// memory — no deserialize, no copy. Borrow only within the callback (the
+    /// shm slot is released when it returns); use a borrowed wincode
+    /// `SchemaRead` type inside for a zero-copy typed view.
     /// The thread busy-spins pinned to `core` (a dedicated core is required);
     /// pinning or service setup failure fails the spawn.
-    pub fn spawn_with_handler<T, F>(
+    pub fn spawn_with_view_handler<F>(
         channel: &str,
         cfg: &IpcConfig,
         core: usize,
         cancel: CancellationToken,
-        handler: F,
+        view: F,
     ) -> eyre::Result<JoinHandle<()>>
     where
-        T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T>,
-        F: FnMut(T) + Send + 'static,
+        F: FnMut(&[u8]) + Send + 'static,
     {
         let channel = channel.to_string();
         let cfg = cfg.clone();
@@ -49,9 +51,9 @@ impl IpcReceiver {
                         return;
                     }
                 };
-                let mut handler = handler;
+                let mut view = view;
                 while !cancel.is_cancelled() {
-                    if !drain(&channel, &subscriber, &mut handler) {
+                    if !drain(&channel, &subscriber, &mut view) {
                         std::hint::spin_loop();
                     }
                 }
@@ -61,6 +63,31 @@ impl IpcReceiver {
             .recv()
             .wrap_err("receiver thread died during setup")??;
         Ok(hdl)
+    }
+
+    /// Deserializing convenience over [`Self::spawn_with_view_handler`]:
+    /// `handler` gets an owned `T` (one deserialize per message).
+    pub fn spawn_with_handler<T, F>(
+        channel: &str,
+        cfg: &IpcConfig,
+        core: usize,
+        cancel: CancellationToken,
+        mut handler: F,
+    ) -> eyre::Result<JoinHandle<()>>
+    where
+        T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T>,
+        F: FnMut(T) + Send + 'static,
+    {
+        let label = channel.to_string();
+        Self::spawn_with_view_handler(channel, cfg, core, cancel, move |bytes: &[u8]| {
+            match wincode::deserialize::<T>(bytes) {
+                Ok(msg) => handler(msg),
+                Err(e) => {
+                    counter!("ipc_deserialize_failures", "channel" => label.clone()).increment(1);
+                    tracing::warn!("win-ipc {label}: deserialize failed: {e:?}");
+                }
+            }
+        })
     }
 
     /// Bridge for tokio consumers; drop-on-full like the UDS paths it replaces.
@@ -117,31 +144,18 @@ fn subscribe(channel: &str, cfg: &IpcConfig) -> eyre::Result<NodeAndSubscriber> 
     Ok((node, subscriber))
 }
 
-fn drain<T, F>(
+fn drain<F: FnMut(&[u8])>(
     channel: &str,
     subscriber: &Subscriber<ipc_threadsafe::Service, [u8], ()>,
-    handler: &mut F,
-) -> bool
-where
-    T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T>,
-    F: FnMut(T),
-{
+    view: &mut F,
+) -> bool {
     let mut got = false;
     loop {
         match subscriber.receive() {
             Ok(Some(sample)) => {
                 got = true;
-                match wincode::deserialize::<T>(sample.payload()) {
-                    Ok(msg) => {
-                        counter!("ipc_received", "channel" => channel.to_string()).increment(1);
-                        handler(msg);
-                    }
-                    Err(e) => {
-                        counter!("ipc_deserialize_failures", "channel" => channel.to_string())
-                            .increment(1);
-                        tracing::warn!("win-ipc {channel}: deserialize failed: {e:?}");
-                    }
-                }
+                counter!("ipc_received", "channel" => channel.to_string()).increment(1);
+                view(sample.payload());
             }
             Ok(None) => break,
             Err(e) => {

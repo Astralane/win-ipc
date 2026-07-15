@@ -125,7 +125,7 @@ fn sender_restart_does_not_break_receiver() {
 fn oversized_message_rejected() {
     let channel = "test-oversize";
     let sender = IpcSender::<TestMessage>::new(channel, &cfg()).unwrap();
-    let big = TestMessage { seq: 1, payload: vec![0; 4096] };
+    let big = TestMessage { seq: 1, payload: vec![0; cfg().max_message_size + 1] };
     assert!(sender.try_send(&big).is_err());
 }
 
@@ -153,5 +153,34 @@ fn tokio_bridge_delivers() {
         msg
     });
     assert!(matches!(got, Ok(Some(_))), "bridge delivered nothing");
+    cancel.cancel();
+}
+
+#[test]
+fn view_handler_gets_raw_bytes() {
+    let channel = "test-view";
+    let received = Arc::new(AtomicU64::new(0));
+    let cancel = CancellationToken::new();
+    let r = received.clone();
+    let _hdl = IpcReceiver::spawn_with_view_handler(
+        channel,
+        &cfg(),
+        0,
+        cancel.clone(),
+        move |bytes: &[u8]| {
+            // borrowed deserialize straight off the shm view
+            let msg: TestMessage = wincode::deserialize(bytes).unwrap();
+            assert_eq!(msg.payload.len(), 256);
+            r.fetch_add(1, Ordering::Relaxed);
+        },
+    )
+    .unwrap();
+
+    let sender = IpcSender::<TestMessage>::new(channel, &cfg()).unwrap();
+    for seq in 0..50u64 {
+        sender.try_send(&TestMessage { seq, payload: vec![7; 256] }).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(wait_for(&received, 30));
     cancel.cancel();
 }
