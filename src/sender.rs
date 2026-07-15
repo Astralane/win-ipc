@@ -1,8 +1,7 @@
+use crate::IpcConfig;
 use crate::node::{create_node, create_port_with_retry};
-use crate::{IpcConfig, event_service_name};
 use eyre::WrapErr as _;
 use iceoryx2::node::Node;
-use iceoryx2::port::notifier::Notifier;
 use iceoryx2::port::publisher::Publisher;
 use iceoryx2::prelude::*;
 use metrics::counter;
@@ -17,7 +16,6 @@ use wincode::config::DefaultConfig;
 pub struct IpcSender<T> {
     _node: Node<ipc_threadsafe::Service>,
     publisher: Publisher<ipc_threadsafe::Service, [u8], ()>,
-    notifier: Option<Notifier<ipc_threadsafe::Service>>,
     channel: String,
     max_message_size: usize,
     _marker: PhantomData<fn(&T)>,
@@ -52,27 +50,9 @@ impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
                 .allocation_strategy(AllocationStrategy::Static)
                 .create()
         })?;
-        let notifier = if cfg.notify_on_send {
-            let event = node
-                .service_builder(
-                    &event_service_name(channel)
-                        .as_str()
-                        .try_into()
-                        .map_err(|e| eyre::eyre!("invalid event service name: {e:?}"))?,
-                )
-                .event()
-                .open_or_create()
-                .map_err(|e| eyre::eyre!("failed to open event service '{channel}/evt': {e:?}"))?;
-            Some(create_port_with_retry("notifier", channel, || {
-                event.notifier_builder().create()
-            })?)
-        } else {
-            None
-        };
         Ok(Self {
             _node: node,
             publisher,
-            notifier,
             channel: channel.to_string(),
             max_message_size: cfg.max_message_size,
             _marker: PhantomData,
@@ -104,9 +84,6 @@ impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
         unsafe { sample.assume_init() }
             .send()
             .map_err(|e| eyre::eyre!("shm send failed on '{}': {e:?}", self.channel))?;
-        if let Some(notifier) = &self.notifier {
-            let _ = notifier.notify();
-        }
         counter!("ipc_sent", "channel" => self.channel.clone()).increment(1);
         Ok(())
     }

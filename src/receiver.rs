@@ -1,25 +1,24 @@
+use crate::IpcConfig;
 use crate::node::{create_node, create_port_with_retry};
-use crate::{IpcConfig, PollMode, event_service_name};
 use eyre::WrapErr as _;
-use iceoryx2::port::listener::Listener;
 use iceoryx2::port::subscriber::Subscriber;
 use iceoryx2::prelude::*;
 use metrics::counter;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use wincode::SchemaRead;
 use wincode::config::DefaultConfig;
-
-const EVENT_WAIT_CYCLE: Duration = Duration::from_millis(100);
 
 pub struct IpcReceiver;
 
 impl IpcReceiver {
     /// Lowest latency: `handler` runs on the polling thread, zero extra hops.
+    /// The thread busy-spins pinned to `core` (a dedicated core is required);
+    /// pinning or service setup failure fails the spawn.
     pub fn spawn_with_handler<T, F>(
         channel: &str,
         cfg: &IpcConfig,
+        core: usize,
         cancel: CancellationToken,
         handler: F,
     ) -> eyre::Result<JoinHandle<()>>
@@ -29,25 +28,46 @@ impl IpcReceiver {
     {
         let channel = channel.to_string();
         let cfg = cfg.clone();
-        std::thread::Builder::new()
+        let (setup_tx, setup_rx) = std::sync::mpsc::sync_channel::<eyre::Result<()>>(1);
+        let hdl = std::thread::Builder::new()
             .name(format!("win-ipc-{channel}"))
             .spawn(move || {
-                if let Some(core) = cfg.core_affinity {
-                    if let Err(e) = affinity::set_thread_affinity([core]) {
-                        tracing::warn!("win-ipc: failed to pin core {core}: {e:?}");
+                let setup = || -> eyre::Result<_> {
+                    affinity::set_thread_affinity([core]).map_err(|e| {
+                        eyre::eyre!("failed to pin receiver '{channel}' to core {core}: {e:?}")
+                    })?;
+                    subscribe(&channel, &cfg)
+                };
+                // node kept alive on this stack for the subscriber's lifetime
+                let (_node, subscriber) = match setup() {
+                    Ok(v) => {
+                        let _ = setup_tx.send(Ok(()));
+                        v
+                    }
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(e));
+                        return;
+                    }
+                };
+                let mut handler = handler;
+                while !cancel.is_cancelled() {
+                    if !drain(&channel, &subscriber, &mut handler) {
+                        std::hint::spin_loop();
                     }
                 }
-                if let Err(e) = run_receive_loop(&channel, &cfg, cancel, handler) {
-                    tracing::error!("win-ipc receiver {channel} exited: {e:?}");
-                }
             })
-            .wrap_err("failed to spawn receiver thread")
+            .wrap_err("failed to spawn receiver thread")?;
+        setup_rx
+            .recv()
+            .wrap_err("receiver thread died during setup")??;
+        Ok(hdl)
     }
 
     /// Bridge for tokio consumers; drop-on-full like the UDS paths it replaces.
     pub fn spawn<T>(
         channel: &str,
         cfg: &IpcConfig,
+        core: usize,
         cancel: CancellationToken,
     ) -> eyre::Result<(tokio::sync::mpsc::Receiver<T>, JoinHandle<()>)>
     where
@@ -55,7 +75,7 @@ impl IpcReceiver {
     {
         let (tx, rx) = tokio::sync::mpsc::channel(cfg.buffer_size);
         let full_label = channel.to_string();
-        let hdl = Self::spawn_with_handler(channel, cfg, cancel, move |msg: T| {
+        let hdl = Self::spawn_with_handler(channel, cfg, core, cancel, move |msg: T| {
             if tx.try_send(msg).is_err() {
                 counter!("ipc_receiver_channel_full", "channel" => full_label.clone())
                     .increment(1);
@@ -65,16 +85,12 @@ impl IpcReceiver {
     }
 }
 
-fn run_receive_loop<T, F>(
-    channel: &str,
-    cfg: &IpcConfig,
-    cancel: CancellationToken,
-    mut handler: F,
-) -> eyre::Result<()>
-where
-    T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T>,
-    F: FnMut(T),
-{
+type NodeAndSubscriber = (
+    iceoryx2::node::Node<ipc_threadsafe::Service>,
+    Subscriber<ipc_threadsafe::Service, [u8], ()>,
+);
+
+fn subscribe(channel: &str, cfg: &IpcConfig) -> eyre::Result<NodeAndSubscriber> {
     let node = create_node().wrap_err_with(|| format!("receiver for channel '{channel}'"))?;
     let service = node
         .service_builder(
@@ -95,61 +111,10 @@ where
                  (peers must use identical IpcConfig QoS settings)"
             )
         })?;
-    let subscriber: Subscriber<ipc_threadsafe::Service, [u8], ()> =
-        create_port_with_retry("subscriber", channel, || {
-            service.subscriber_builder().create()
-        })?;
-
-    let listener: Option<Listener<ipc_threadsafe::Service>> = match cfg.poll_mode {
-        PollMode::BusySpin => None,
-        _ => {
-            let event = node
-                .service_builder(
-                    &event_service_name(channel)
-                        .as_str()
-                        .try_into()
-                        .map_err(|e| eyre::eyre!("invalid event service name: {e:?}"))?,
-                )
-                .event()
-                .open_or_create()
-                .map_err(|e| eyre::eyre!("failed to open event service '{channel}/evt': {e:?}"))?;
-            Some(create_port_with_retry("listener", channel, || {
-                event.listener_builder().create()
-            })?)
-        }
-    };
-
-    while !cancel.is_cancelled() {
-        let drained = drain(channel, &subscriber, &mut handler);
-        if drained {
-            continue;
-        }
-        match cfg.poll_mode {
-            PollMode::BusySpin => std::hint::spin_loop(),
-            PollMode::SpinThenWait { spin } => {
-                let deadline = Instant::now() + spin;
-                let mut got = false;
-                while Instant::now() < deadline {
-                    if drain(channel, &subscriber, &mut handler) {
-                        got = true;
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
-                if !got {
-                    if let Some(l) = &listener {
-                        let _ = l.timed_wait_all(|_| {}, EVENT_WAIT_CYCLE);
-                    }
-                }
-            }
-            PollMode::Event { cycle } => {
-                if let Some(l) = &listener {
-                    let _ = l.timed_wait_all(|_| {}, cycle);
-                }
-            }
-        }
-    }
-    Ok(())
+    let subscriber = create_port_with_retry("subscriber", channel, || {
+        service.subscriber_builder().create()
+    })?;
+    Ok((node, subscriber))
 }
 
 fn drain<T, F>(

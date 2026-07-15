@@ -1,4 +1,4 @@
-use win_ipc::{IpcConfig, IpcReceiver, IpcSender, PollMode};
+use win_ipc::{IpcConfig, IpcReceiver, IpcSender};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,12 +12,7 @@ struct TestMessage {
 }
 
 fn cfg() -> IpcConfig {
-    IpcConfig {
-        poll_mode: PollMode::Event {
-            cycle: Duration::from_millis(10),
-        },
-        ..Default::default()
-    }
+    IpcConfig::default()
 }
 
 fn wait_for(counter: &AtomicU64, target: u64) -> bool {
@@ -36,7 +31,7 @@ fn delivers_messages() {
     let received = Arc::new(AtomicU64::new(0));
     let cancel = CancellationToken::new();
     let r = received.clone();
-    let _hdl = IpcReceiver::spawn_with_handler(channel, &cfg(), cancel.clone(), move |m: TestMessage| {
+    let _hdl = IpcReceiver::spawn_with_handler(channel, &cfg(), 0, cancel.clone(), move |m: TestMessage| {
         assert_eq!(m.payload.len(), 1232);
         r.fetch_add(1, Ordering::Relaxed);
         let _ = m.seq;
@@ -61,7 +56,7 @@ fn receiver_restart_does_not_break_sender() {
     let cancel1 = CancellationToken::new();
     let received1 = Arc::new(AtomicU64::new(0));
     let r1 = received1.clone();
-    let hdl1 = IpcReceiver::spawn_with_handler(channel, &cfg(), cancel1.clone(), move |_: TestMessage| {
+    let hdl1 = IpcReceiver::spawn_with_handler(channel, &cfg(), 0, cancel1.clone(), move |_: TestMessage| {
         r1.fetch_add(1, Ordering::Relaxed);
     })
     .unwrap();
@@ -84,7 +79,7 @@ fn receiver_restart_does_not_break_sender() {
     let cancel2 = CancellationToken::new();
     let received2 = Arc::new(AtomicU64::new(0));
     let r2 = received2.clone();
-    let _hdl2 = IpcReceiver::spawn_with_handler(channel, &cfg(), cancel2.clone(), move |_: TestMessage| {
+    let _hdl2 = IpcReceiver::spawn_with_handler(channel, &cfg(), 0, cancel2.clone(), move |_: TestMessage| {
         r2.fetch_add(1, Ordering::Relaxed);
     })
     .unwrap();
@@ -102,7 +97,7 @@ fn sender_restart_does_not_break_receiver() {
     let received = Arc::new(AtomicU64::new(0));
     let cancel = CancellationToken::new();
     let r = received.clone();
-    let _hdl = IpcReceiver::spawn_with_handler(channel, &cfg(), cancel.clone(), move |_: TestMessage| {
+    let _hdl = IpcReceiver::spawn_with_handler(channel, &cfg(), 0, cancel.clone(), move |_: TestMessage| {
         r.fetch_add(1, Ordering::Relaxed);
     })
     .unwrap();
@@ -139,7 +134,7 @@ fn tokio_bridge_delivers() {
     let channel = "test-bridge";
     let cancel = CancellationToken::new();
     let (mut rx, _hdl) =
-        IpcReceiver::spawn::<TestMessage>(channel, &cfg(), cancel.clone()).unwrap();
+        IpcReceiver::spawn::<TestMessage>(channel, &cfg(), 0, cancel.clone()).unwrap();
     let sender = IpcSender::<TestMessage>::new(channel, &cfg()).unwrap();
 
     let rt = tokio::runtime::Builder::new_current_thread()

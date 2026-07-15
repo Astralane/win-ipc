@@ -44,10 +44,15 @@ fn main() -> eyre::Result<()> {
             }
         }
         "sub" => {
+            let core = std::env::args()
+                .nth(2)
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
             let last = AtomicU64::new(0);
             let hdl = IpcReceiver::spawn_with_handler(
                 CHANNEL,
                 &cfg,
+                core,
                 CancellationToken::new(),
                 move |msg: DemoMessage| {
                     let transit_us = now_nanos().saturating_sub(msg.created_at_nanos) / 1_000;
