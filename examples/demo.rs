@@ -22,7 +22,7 @@ fn now_nanos() -> u64 {
         .as_nanos() as u64
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> eyre::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let cfg = IpcConfig::default();
     match mode.as_str() {

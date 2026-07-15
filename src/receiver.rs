@@ -1,6 +1,6 @@
 use crate::node::{create_node, create_port_with_retry};
 use crate::{IpcConfig, PollMode, event_service_name};
-use anyhow::Context as _;
+use eyre::WrapErr as _;
 use iceoryx2::port::listener::Listener;
 use iceoryx2::port::subscriber::Subscriber;
 use iceoryx2::prelude::*;
@@ -22,7 +22,7 @@ impl IpcReceiver {
         cfg: &IpcConfig,
         cancel: CancellationToken,
         handler: F,
-    ) -> anyhow::Result<JoinHandle<()>>
+    ) -> eyre::Result<JoinHandle<()>>
     where
         T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T>,
         F: FnMut(T) + Send + 'static,
@@ -41,7 +41,7 @@ impl IpcReceiver {
                     tracing::error!("win-ipc receiver {channel} exited: {e:?}");
                 }
             })
-            .context("spawning receiver thread")
+            .wrap_err("failed to spawn receiver thread")
     }
 
     /// Bridge for tokio consumers; drop-on-full like the UDS paths it replaces.
@@ -49,7 +49,7 @@ impl IpcReceiver {
         channel: &str,
         cfg: &IpcConfig,
         cancel: CancellationToken,
-    ) -> anyhow::Result<(tokio::sync::mpsc::Receiver<T>, JoinHandle<()>)>
+    ) -> eyre::Result<(tokio::sync::mpsc::Receiver<T>, JoinHandle<()>)>
     where
         T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T> + Send + 'static,
     {
@@ -70,14 +70,18 @@ fn run_receive_loop<T, F>(
     cfg: &IpcConfig,
     cancel: CancellationToken,
     mut handler: F,
-) -> anyhow::Result<()>
+) -> eyre::Result<()>
 where
     T: for<'de> SchemaRead<'de, DefaultConfig, Dst = T>,
     F: FnMut(T),
 {
-    let node = create_node()?;
+    let node = create_node().wrap_err_with(|| format!("receiver for channel '{channel}'"))?;
     let service = node
-        .service_builder(&channel.try_into()?)
+        .service_builder(
+            &channel
+                .try_into()
+                .map_err(|e| eyre::eyre!("invalid channel name '{channel}': {e:?}"))?,
+        )
         .publish_subscribe::<[u8]>()
         .subscriber_max_buffer_size(cfg.buffer_size)
         .enable_safe_overflow(true)
@@ -85,19 +89,33 @@ where
         .max_publishers(cfg.max_publishers)
         .max_subscribers(cfg.max_subscribers)
         .open_or_create()
-        .context("opening pub/sub service")?;
+        .map_err(|e| {
+            eyre::eyre!(
+                "failed to open pub/sub service '{channel}': {e:?} \
+                 (peers must use identical IpcConfig QoS settings)"
+            )
+        })?;
     let subscriber: Subscriber<ipc_threadsafe::Service, [u8], ()> =
-        create_port_with_retry(|| service.subscriber_builder().create())?;
+        create_port_with_retry("subscriber", channel, || {
+            service.subscriber_builder().create()
+        })?;
 
     let listener: Option<Listener<ipc_threadsafe::Service>> = match cfg.poll_mode {
         PollMode::BusySpin => None,
         _ => {
             let event = node
-                .service_builder(&event_service_name(channel).as_str().try_into()?)
+                .service_builder(
+                    &event_service_name(channel)
+                        .as_str()
+                        .try_into()
+                        .map_err(|e| eyre::eyre!("invalid event service name: {e:?}"))?,
+                )
                 .event()
                 .open_or_create()
-                .context("opening event service")?;
-            Some(create_port_with_retry(|| event.listener_builder().create())?)
+                .map_err(|e| eyre::eyre!("failed to open event service '{channel}/evt': {e:?}"))?;
+            Some(create_port_with_retry("listener", channel, || {
+                event.listener_builder().create()
+            })?)
         }
     };
 

@@ -1,15 +1,16 @@
-use anyhow::Context as _;
+use eyre::WrapErr as _;
 use iceoryx2::config::Config;
 use iceoryx2::node::{Node, NodeState};
 use iceoryx2::prelude::*;
 
 /// Create a node, sweeping stale resources of dead nodes first so a
 /// crash-restart can't be blocked by leaked port slots.
-pub(crate) fn create_node() -> anyhow::Result<Node<ipc_threadsafe::Service>> {
+pub(crate) fn create_node() -> eyre::Result<Node<ipc_threadsafe::Service>> {
     sweep_dead_nodes();
     NodeBuilder::new()
         .create::<ipc_threadsafe::Service>()
-        .context("creating iceoryx2 node")
+        .map_err(|e| eyre::eyre!("{e:?}"))
+        .wrap_err("failed to create iceoryx2 node (is /dev/shm and /tmp/iceoryx2 writable?)")
 }
 
 pub(crate) fn sweep_dead_nodes() {
@@ -25,14 +26,23 @@ pub(crate) fn sweep_dead_nodes() {
 
 /// Retry `create` once after a dead-node sweep; a crashed peer's port slot may
 /// still be occupied until the sweep runs.
-pub(crate) fn create_port_with_retry<T, E: std::fmt::Debug>(
+pub(crate) fn create_port_with_retry<T, E: core::fmt::Debug>(
+    what: &str,
+    channel: &str,
     mut create: impl FnMut() -> Result<T, E>,
-) -> anyhow::Result<T> {
+) -> eyre::Result<T> {
     match create() {
         Ok(v) => Ok(v),
         Err(first) => {
             sweep_dead_nodes();
-            create().map_err(|e| anyhow::anyhow!("port creation failed: {first:?}, then {e:?}"))
+            create().map_err(|e| {
+                eyre::eyre!(
+                    "failed to create {what} on channel '{channel}': {first:?} \
+                     (retried after dead-node sweep: {e:?}). If this is \
+                     ExceedsMaxSupported*, raise max_publishers/max_subscribers in \
+                     IpcConfig or check for orphaned peers"
+                )
+            })
         }
     }
 }

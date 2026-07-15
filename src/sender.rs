@@ -1,6 +1,6 @@
 use crate::node::{create_node, create_port_with_retry};
 use crate::{IpcConfig, event_service_name};
-use anyhow::Context as _;
+use eyre::WrapErr as _;
 use iceoryx2::node::Node;
 use iceoryx2::port::notifier::Notifier;
 use iceoryx2::port::publisher::Publisher;
@@ -24,10 +24,14 @@ pub struct IpcSender<T> {
 }
 
 impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
-    pub fn new(channel: &str, cfg: &IpcConfig) -> anyhow::Result<Self> {
-        let node = create_node()?;
+    pub fn new(channel: &str, cfg: &IpcConfig) -> eyre::Result<Self> {
+        let node = create_node().wrap_err_with(|| format!("sender for channel '{channel}'"))?;
         let service = node
-            .service_builder(&channel.try_into()?)
+            .service_builder(
+                &channel
+                    .try_into()
+                    .map_err(|e| eyre::eyre!("invalid channel name '{channel}': {e:?}"))?,
+            )
             .publish_subscribe::<[u8]>()
             .subscriber_max_buffer_size(cfg.buffer_size)
             .enable_safe_overflow(true)
@@ -35,8 +39,13 @@ impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
             .max_publishers(cfg.max_publishers)
             .max_subscribers(cfg.max_subscribers)
             .open_or_create()
-            .context("opening pub/sub service")?;
-        let publisher = create_port_with_retry(|| {
+            .map_err(|e| {
+                eyre::eyre!(
+                    "failed to open pub/sub service '{channel}': {e:?} \
+                     (peers must use identical IpcConfig QoS settings)"
+                )
+            })?;
+        let publisher = create_port_with_retry("publisher", channel, || {
             service
                 .publisher_builder()
                 .initial_max_slice_len(cfg.max_message_size)
@@ -45,11 +54,16 @@ impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
         })?;
         let notifier = if cfg.notify_on_send {
             let event = node
-                .service_builder(&event_service_name(channel).as_str().try_into()?)
+                .service_builder(
+                    &event_service_name(channel)
+                        .as_str()
+                        .try_into()
+                        .map_err(|e| eyre::eyre!("invalid event service name: {e:?}"))?,
+                )
                 .event()
                 .open_or_create()
-                .context("opening event service")?;
-            Some(create_port_with_retry(|| {
+                .map_err(|e| eyre::eyre!("failed to open event service '{channel}/evt': {e:?}"))?;
+            Some(create_port_with_retry("notifier", channel, || {
                 event.notifier_builder().create()
             })?)
         } else {
@@ -65,23 +79,31 @@ impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
         })
     }
 
-    pub fn try_send(&self, msg: &T) -> anyhow::Result<()> {
+    pub fn try_send(&self, msg: &T) -> eyre::Result<()> {
         let size = wincode::serialized_size(msg)
-            .map_err(|e| anyhow::anyhow!("serialized_size: {e:?}"))? as usize;
+            .map_err(|e| eyre::eyre!("cannot size message for '{}': {e:?}", self.channel))?
+            as usize;
         if size > self.max_message_size {
             counter!("ipc_publish_failures", "channel" => self.channel.clone()).increment(1);
-            anyhow::bail!("message size {size} exceeds max {}", self.max_message_size);
+            eyre::bail!(
+                "message of {size}B exceeds max_message_size {}B on channel '{}'",
+                self.max_message_size,
+                self.channel
+            );
         }
-        let mut sample = self
-            .publisher
-            .loan_slice_uninit(size)
-            .map_err(|e| anyhow::anyhow!("loan: {e:?}"))?;
+        let mut sample = self.publisher.loan_slice_uninit(size).map_err(|e| {
+            eyre::eyre!(
+                "failed to loan {size}B sample on '{}': {e:?} \
+                 (all loaned samples in use? subscriber holding too many borrows?)",
+                self.channel
+            )
+        })?;
         wincode::serialize_into(sample.payload_mut(), msg)
-            .map_err(|e| anyhow::anyhow!("serialize: {e:?}"))?;
+            .map_err(|e| eyre::eyre!("serialize failed on '{}': {e:?}", self.channel))?;
         // payload fully written by serialize_into (size == serialized_size)
         unsafe { sample.assume_init() }
             .send()
-            .map_err(|e| anyhow::anyhow!("send: {e:?}"))?;
+            .map_err(|e| eyre::eyre!("shm send failed on '{}': {e:?}", self.channel))?;
         if let Some(notifier) = &self.notifier {
             let _ = notifier.notify();
         }
