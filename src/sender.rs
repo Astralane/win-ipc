@@ -47,6 +47,7 @@ impl<T: SchemaWrite<DefaultConfig, Src = T>> IpcSender<T> {
             service
                 .publisher_builder()
                 .initial_max_slice_len(cfg.max_message_size)
+                .max_loaned_samples(cfg.max_loaned_samples)
                 .allocation_strategy(AllocationStrategy::Static)
                 .create()
         })?;

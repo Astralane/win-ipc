@@ -21,6 +21,7 @@ pub struct IpcConfig {
     pub buffer_size: usize,
     pub max_publishers: usize,
     pub max_subscribers: usize,
+    pub max_loaned_samples: usize,
 }
 
 impl Default for IpcConfig {
@@ -30,6 +31,7 @@ impl Default for IpcConfig {
             buffer_size: 1024,
             max_publishers: 2,
             max_subscribers: 2,
+            max_loaned_samples: 64,
         }
     }
 }
