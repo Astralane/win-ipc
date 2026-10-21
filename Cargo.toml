@@ -1,6 +1,6 @@
 [package]
 name = "win-ipc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Restart-safe shared-memory IPC channels: iceoryx2 transport, wincode serialization"
@@ -9,7 +9,7 @@ repository = "https://github.com/Astralane/win-ipc"
 
 [dependencies]
 iceoryx2 = "0.9.3"
-wincode = { version = "0.5.5", features = ["derive"] }
+wincode = { version = "0.6.1", features = ["derive"] }
 eyre = "0.6"
 metrics = "0.24"
 tracing = "0.1"
